@@ -578,23 +578,53 @@ def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
         model = build_model().fit(Xs, y)
     tau = model.threshold()
 
-    # p_old bestimmen (beide Quellen ermitteln)
-    if "Churn_Wahrscheinlichkeit" in df.columns:
+    # p_old bestimmen (bevorzugt aus backtest_results, sonst Fallback)
+    # Quelle: JSON-DB Tabelle "backtest_results" (Feld churn_probability) je Kunde und experiment_id
+    try:
+        db_bt = ChurnJSONDatabase()
+        bt_records = (db_bt.data.get("tables", {}).get("backtest_results", {}) or {}).get("records", []) or []
+        probs_by_kunde = {}
+        for r in bt_records:
+            try:
+                if int(r.get("id_experiments") or r.get("experiment_id") or -1) != int(experiment_id):
+                    continue
+                k = r.get("Kunde")
+                p = r.get("churn_probability") or r.get("CHURN_PROBABILITY")
+                if k is not None and p is not None:
+                    probs_by_kunde[int(k)] = float(p)
+            except Exception:
+                continue
+        if "Kunde" in df.columns and probs_by_kunde:
+            df["churn_probability"] = df["Kunde"].map(lambda x: probs_by_kunde.get(int(x)) if pd.notna(x) else np.nan).astype(float)
+        else:
+            df["churn_probability"] = np.nan
+    except Exception:
+        df["churn_probability"] = np.nan
+
+    # Fallback: versuche alte Spalte "Churn_Wahrscheinlichkeit" zu verwenden, falls vorhanden
+    if df["churn_probability"].isna().all() and "Churn_Wahrscheinlichkeit" in df.columns:
         try:
-            p_old_series = pd.to_numeric(df["Churn_Wahrscheinlichkeit"], errors="coerce")
+            df["churn_probability"] = pd.to_numeric(df["Churn_Wahrscheinlichkeit"], errors="coerce")
         except Exception:
-            p_old_series = pd.Series([np.nan] * len(df))
-    else:
-        p_old_series = pd.Series([np.nan] * len(df))
+            pass
+
+    # Modell-basierte Wahrscheinlichkeit (surrogate), als zusätzlicher Fallback
     try:
         p_old_model = model.predict_proba(Xs)[:, 1]
     except Exception:
         p_old_model = np.zeros(Xs.shape[0])
-    p_old_df = p_old_series.astype(float).values if isinstance(p_old_series, pd.Series) else np.full(Xs.shape[0], np.nan)
-    p_old = p_old_model  # Modellschätzung (für p_new Berechnung bleibt das Modell maßgeblich)
 
-    # Filter: nur Kunden mit 0.4 <= rf_prob (DF) <= 0.9
-    sel_idx = [i for i in range(len(p_old_df)) if (not np.isnan(p_old_df[i]) and 0.4 <= p_old_df[i] <= 0.9)]
+    # Selektion: bevorzugt nach backtest churn_probability (0.4..0.9), sonst nach Modellprobabilität
+    p_old_df = df["churn_probability"].astype(float).values
+    sel_idx = [i for i in range(len(p_old_df)) if (not np.isnan(p_old_df[i]) and 0.4 <= float(p_old_df[i]) <= 0.9)]
+    if not sel_idx:
+        # Fallback-Filter mit Modellprobabilität (0.4..0.9)
+        sel_idx = [i for i in range(len(p_old_model)) if 0.4 <= float(p_old_model[i]) <= 0.9]
+    if not sel_idx:
+        # Letzter Fallback: Top-N nach Modellprobabilität
+        order = np.argsort(-p_old_model)
+        n = int(limit) if (limit and int(limit) > 0) else min(200, len(order))
+        sel_idx = list(order[:n])
     if limit and limit > 0:
         sel_idx = sel_idx[:int(limit)]
 
@@ -603,10 +633,12 @@ def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
     names = list(feature_cols)
     for idx in sel_idx:
         x0_raw = X[idx]
-        p_old_df_i = float(p_old_df[idx]) if not np.isnan(p_old_df[idx]) else None
-        if p_old_df_i is None:
-            continue
-        # Zieldefinition: mindestens 20% Reduktion relativ zur RF-Probabilität aus CUSTOMER_DETAILS
+        # p_old aus backtest_results (bevorzugt) oder Modell
+        if not np.isnan(p_old_df[idx]):
+            p_old_df_i = float(p_old_df[idx])
+        else:
+            p_old_df_i = float(p_old_model[idx])
+        # Zieldefinition: mindestens 20% Reduktion relativ zu p_old
         p_target = float(p_old_df_i * 0.8)
         z_raw, dist, top_changes = find_counterfactual(
             x0_raw, names, model, scaler, policy, max_iter=200, p_target=p_target, tau=None
