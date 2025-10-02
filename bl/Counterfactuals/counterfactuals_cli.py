@@ -27,7 +27,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -117,6 +117,150 @@ def engineered_feature_set_from_mapping(mapping: Dict[str, List[str]]) -> List[s
         if isinstance(lst, list):
             feats.extend([x for x in lst if isinstance(x, str)])
     return sorted(set(feats))
+
+
+def _load_shap_local_from_jsondb(experiment_id: int, aggregated: bool = False) -> List[Dict[str, Any]]:
+    """Lädt lokale SHAP-TopK-Records aus der JSON-DB.
+    aggregated=False → Tabelle 'shap_local_topk'
+    aggregated=True  → Tabelle 'shap_local_topk_aggregated'
+    """
+    db = ChurnJSONDatabase()
+    tables = db.data.get("tables", {}) or {}
+    name = "shap_local_topk_aggregated" if aggregated else "shap_local_topk"
+    tbl = tables.get(name, {}) or {}
+    recs = tbl.get("records", []) or []
+    out: List[Dict[str, Any]] = []
+    for r in recs:
+        try:
+            exp_id = int(r.get("experiment_id")) if r.get("experiment_id") is not None else int(r.get("id_experiments"))
+        except Exception:
+            continue
+        if int(exp_id) != int(experiment_id):
+            continue
+        out.append(r)
+    return out
+
+
+def _expand_raw_to_engineered(raw_feats: Iterable[str], feature_mapping: Dict[str, List[str]], available_cols: Iterable[str]) -> List[str]:
+    """Expandiere Raw-Features mittels Mapping zu engineered Spalten und filtere auf existierende df-Spalten."""
+    avail = set(str(c) for c in available_cols)
+    expanded: List[str] = []
+    for raw in raw_feats:
+        lst = feature_mapping.get(str(raw), []) or []
+        for eng in lst:
+            if str(eng) in avail:
+                expanded.append(str(eng))
+    # Fallback: wenn kein Mapping vorhanden, versuche Präfix-Match RAW_
+    if not expanded:
+        for raw in raw_feats:
+            prefix = f"{str(raw)}_"
+            for c in avail:
+                if c == str(raw) or c.startswith(prefix) or (str(raw) == "N_DIGITALIZATIONRATE" and c.startswith("N_DIGITALIZATIONRATE")):
+                    expanded.append(c)
+    return sorted(set(expanded))
+
+
+def build_shap_feature_map_per_customer(
+    experiment_id: int,
+    df_columns: Iterable[str],
+    use_aggregated: bool = True,
+    top_k_local: Optional[int] = None,
+) -> Dict[int, List[str]]:
+    """Erzeugt pro Kunde eine Liste modifizierbarer engineered Features auf Basis lokaler SHAP-TopK.
+
+    - aggregated=True: Raw-Feature-Namen aus SHAP via Mapping zu engineered Spalten expandieren
+    - aggregated=False: SHAP liefert engineered Spalten direkt
+    - top_k_local: optionales Limit pro Kunde
+    """
+    rows = _load_shap_local_from_jsondb(experiment_id=experiment_id, aggregated=use_aggregated)
+    # Fallback: wenn aggregiert angefragt aber leer, versuche nicht-aggregiert
+    if not rows and use_aggregated:
+        rows = _load_shap_local_from_jsondb(experiment_id=experiment_id, aggregated=False)
+    if not rows:
+        raise RuntimeError(
+            "Keine lokalen SHAP-TopK in JSON-DB gefunden. Bitte SHAP-Service für dieses Experiment ausführen."
+        )
+
+    # Gruppiere nach Kunde und sortiere nach rank
+    from collections import defaultdict
+    cust_to_feats: Dict[int, List[str]] = defaultdict(list)
+    if use_aggregated:
+        mapping = load_feature_mapping()
+    else:
+        mapping = {}
+
+    for r in rows:
+        try:
+            cust = int(r.get("Kunde") or r.get("customer_id"))
+        except Exception:
+            continue
+        feat = str(r.get("feature")) if r.get("feature") is not None else None
+        if not feat:
+            continue
+        cust_to_feats[cust].append(feat)
+
+    df_cols = list(df_columns)
+    per_customer_eng: Dict[int, List[str]] = {}
+    for cust, feats in cust_to_feats.items():
+        # sortiere nach Rang, falls vorhanden
+        try:
+            feats_sorted = sorted(
+                feats,
+                key=lambda f: next((int(r.get("rank")) for r in rows if (str(r.get("feature")) == str(f) and int(r.get("Kunde") or r.get("customer_id")) == cust and r.get("rank") is not None)), 1_000_000)
+            )
+        except Exception:
+            feats_sorted = feats
+
+        if top_k_local and top_k_local > 0:
+            feats_sorted = feats_sorted[: int(top_k_local)]
+
+        if use_aggregated:
+            eng = _expand_raw_to_engineered(feats_sorted, feature_mapping=mapping, available_cols=df_cols)
+        else:
+            eng = [f for f in feats_sorted if f in df_cols]
+        per_customer_eng[cust] = sorted(set(eng))
+
+    return per_customer_eng
+
+
+# Import zentrale Segmentierungsfunktion
+from config.digitalization_segmentation import (
+    infer_digitalization_cluster,
+    segment_data_by_digitalization,
+    create_segmented_aggregate
+)
+
+
+def build_unit_policy_for_features(df: pd.DataFrame, feature_names: List[str], default_step: float = 0.1) -> Policy:
+    """Erzeugt eine Policy mit unit weights (=1.0) und plausiblen Bounds (Perzentile) für die angegebenen engineered Features."""
+    features_cfg: Dict[str, Dict[str, Any]] = {}
+    for name in feature_names:
+        col = pd.to_numeric(df[name], errors="coerce")
+        col = col.replace([np.inf, -np.inf], np.nan)
+        q01 = float(np.nanpercentile(col.values, 1)) if col.notna().any() else 0.0
+        q99 = float(np.nanpercentile(col.values, 99)) if col.notna().any() else 0.0
+        # Typ-Inferenz
+        unique_vals = pd.unique(col.dropna())
+        if len(unique_vals) <= 2 and set(np.round(unique_vals, 6)).issubset({0.0, 1.0}):
+            ftype = "binary"
+            step = 1.0
+            fmin, fmax = 0.0, 1.0
+        elif str(df[name].dtype).startswith("int"):
+            ftype = "integer"
+            step = 1.0
+            fmin, fmax = math.floor(q01), math.ceil(q99)
+        else:
+            ftype = "float"
+            step = default_step
+            fmin, fmax = q01, q99
+        features_cfg[name] = {
+            "weight": 1.0,
+            "type": ftype,
+            "step": step,
+            "min": fmin,
+            "max": fmax,
+        }
+    return Policy(default_step=default_step, features=features_cfg)
 
 
 def choose_policy_features(df: pd.DataFrame, policy: Policy) -> List[str]:
@@ -283,7 +427,8 @@ def find_counterfactual(x0_raw: np.ndarray,
                         policy: Policy,
                         max_iter: int = 200,
                         p_target: Optional[float] = None,
-                        tau: Optional[float] = None) -> Tuple[np.ndarray, float, List[Dict[str, Any]]]:
+                        tau: Optional[float] = None,
+                        allowed_feature_names: Optional[Set[str]] = None) -> Tuple[np.ndarray, float, List[Dict[str, Any]]]:
     # Suche im Roh-Feature-Raum; Bewertung im Modellraum (via scaler)
     z = x0_raw.copy()
     best_dist = weighted_l2(z, x0_raw, names, policy)
@@ -299,6 +444,8 @@ def find_counterfactual(x0_raw: np.ndarray,
                 break
         improved = False
         for j, name in enumerate(names):
+            if allowed_feature_names is not None and name not in allowed_feature_names:
+                continue
             pol = policy.features.get(name, {})
             step = float(pol.get("step", policy.default_step))
             for direction in (-1.0, 1.0):
@@ -518,11 +665,119 @@ def _create_business_metrics(
     }
 
 
+def _create_digitalization_segmented_analysis(
+    individual: List[Dict[str, Any]], 
+    aggregate: List[Dict[str, Any]], 
+    df: pd.DataFrame, 
+    experiment_id: int, 
+    db: ChurnJSONDatabase
+) -> None:
+    """Erstellt Digitalization-segmentierte CF-Analyse mit zentraler Segmentierungsfunktion."""
+    try:
+        # Segmentiere Individual-Daten nach Digitalization-Clustern
+        cf_individual_by_digitalization = segment_data_by_digitalization(individual, df)
+        
+        # Erstelle segmentierte Aggregate
+        cf_aggregate_by_digitalization = create_segmented_aggregate(
+            [change for customer in individual for change in customer.get("top_changes", [])],
+            df,
+            feature_field="feature",
+            impact_field="abs_delta"
+        )
+        
+        # Business Metrics: ROI-Analyse pro Cluster
+        cf_business_metrics_by_digitalization = []
+        for customer in individual:
+            if customer.get("no_cf_found"):
+                continue
+            
+            # Cluster für diesen Kunden ermitteln
+            customer_idx = individual.index(customer)
+            clusters = infer_digitalization_cluster(df)
+            cluster = clusters[customer_idx] if customer_idx < len(clusters) else "DIGI_UNKNOWN"
+            
+            customer_id = customer.get("Kunde")
+            p_old = customer.get("p_old", 0.0)
+            p_new = customer.get("p_new", 0.0)
+            total_cost = customer.get("l2_weighted", 0.0)
+            
+            # Business-Metriken
+            churn_risk_reduction = p_old - p_new
+            relative_reduction = churn_risk_reduction / p_old if p_old > 0 else 0.0
+            avg_customer_value = 1000.0
+            churn_cost_factor = 0.2
+            potential_savings = churn_risk_reduction * avg_customer_value * churn_cost_factor
+            roi = (potential_savings - total_cost) / total_cost if total_cost > 0 else float('inf')
+            
+            recommendation = "highly_recommended" if roi > 3.0 else \
+                            "recommended" if roi > 1.0 else \
+                            "consider" if roi > 0.0 else \
+                            "not_recommended"
+            
+            cf_business_metrics_by_digitalization.append({
+                "customer_id": customer_id,
+                "digitalization_group": cluster,
+                "p_old": p_old,
+                "p_new": p_new,
+                "churn_risk_reduction": churn_risk_reduction,
+                "relative_reduction": relative_reduction,
+                "implementation_cost": total_cost,
+                "potential_savings": potential_savings,
+                "net_benefit": potential_savings - total_cost,
+                "roi": roi if roi != float('inf') else 999.99,
+                "recommendation": recommendation,
+                "avg_customer_value": avg_customer_value,
+                "churn_cost_factor": churn_cost_factor,
+                "experiment_id": experiment_id
+            })
+
+        # Persistiere segmentierte Ergebnisse
+        def _upsert_table_segmented(table_name: str, records: List[Dict[str, Any]]):
+            tbl = db.data["tables"].setdefault(table_name, {"description": "Counterfactuals by Digitalization", "source": "counterfactuals_cli", "records": []})
+            existing: List[Dict[str, Any]] = tbl.get("records", []) or []
+            # Entferne vorhandene Records für dieses Experiment
+            remaining = [r for r in existing if int(r.get("id_experiments", -1)) != int(experiment_id)]
+            # Anreichern um experiment_id
+            for r in records:
+                if isinstance(r, dict):
+                    r = dict(r)
+                    r["id_experiments"] = int(experiment_id)
+                    remaining.append(r)
+            tbl["records"] = remaining
+            db.data["tables"][table_name] = tbl
+
+        # Flatten segmentierte Individual-Daten
+        all_individual_segmented = []
+        for cluster, customers in cf_individual_by_digitalization.items():
+            all_individual_segmented.extend(customers)
+
+        _upsert_table_segmented("cf_individual_by_digitalization", all_individual_segmented)
+        _upsert_table_segmented("cf_aggregate_by_digitalization", cf_aggregate_by_digitalization)
+        _upsert_table_segmented("cf_business_metrics_by_digitalization", cf_business_metrics_by_digitalization)
+
+        print(f"💾 Digitalization-segmentierte CF-Analyse gespeichert:")
+        print(f"   - {len(all_individual_segmented)} Kunden in {len(cf_individual_by_digitalization)} Clustern")
+        print(f"   - {len(cf_aggregate_by_digitalization)} Feature-Impacts")
+        print(f"   - {len(cf_business_metrics_by_digitalization)} Business-Metriken")
+
+    except Exception as e:
+        print(f"❌ Fehler bei Digitalization-Segmentierung: {e}")
+        raise
+
+
 # =============================
 # Main
 # =============================
 
-def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
+def run(
+    experiment_id: int,
+    sample: float = 0.2,
+    limit: int = 0,
+    use_shap_features: bool = True,
+    use_aggregated_shap: bool = True,
+    top_k_local: Optional[int] = None,
+    top_n_global: Optional[int] = 50,
+) -> bool:
     iface = SQLQueryInterface()
     sql = f"""
     SELECT *
@@ -555,11 +810,31 @@ def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
     y = (~df["I_ALIVE"].astype(str).str.lower().isin(["true", "1"])) if "I_ALIVE" in df.columns else (~df["I_Alive"].astype(str).str.lower().isin(["true", "1"]))
     y = y.astype(bool).values
 
-    # Policy laden und Feature-Selektion strikt nach Policy
-    policy = load_policy()
-    feature_cols = choose_policy_features(df, policy)
-    if not feature_cols:
-        raise RuntimeError("Keine geeigneten engineered Features in CUSTOMER_DETAILS gefunden.")
+    # Feature-Selektion
+    if use_shap_features:
+        # SHAP-basiert: per Kunde modifizierbare Features, Modellraum = Vereinigung
+        try:
+            per_customer_allowed = build_shap_feature_map_per_customer(
+                experiment_id=experiment_id,
+                df_columns=[c for c in df.columns if c not in META_COLS and c not in FORBIDDEN_EXACT and not any(str(c).startswith(p) for p in FORBIDDEN_PREFIXES)],
+                use_aggregated=use_aggregated_shap,
+                top_k_local=top_k_local,
+            )
+        except Exception as e:
+            raise RuntimeError(f"SHAP-Features konnten nicht geladen werden: {e}")
+
+        # Vereinigung aller erlaubten engineered Features als Modell-Featuremenge
+        feature_cols = sorted({f for feats in per_customer_allowed.values() for f in feats})
+        if not feature_cols:
+            raise RuntimeError("Keine SHAP-basierten Features gefunden. Bitte SHAP-Service ausführen oder Konfiguration prüfen.")
+        # Policy: unit weights + Bounds aus Daten
+        policy = build_unit_policy_for_features(df, feature_cols, default_step=0.1)
+    else:
+        # Policy-basiert (Bestand)
+        policy = load_policy()
+        feature_cols = choose_policy_features(df, policy)
+        if not feature_cols:
+            raise RuntimeError("Keine geeigneten engineered Features in CUSTOMER_DETAILS gefunden.")
     X_df = df[feature_cols].copy().apply(pd.to_numeric, errors="coerce").fillna(0.0)
     X = X_df.values
 
@@ -640,8 +915,26 @@ def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
             p_old_df_i = float(p_old_model[idx])
         # Zieldefinition: mindestens 20% Reduktion relativ zu p_old
         p_target = float(p_old_df_i * 0.8)
+        if use_shap_features:
+            # Erlaubte Features je Kunde
+            try:
+                cust_id = int(df.iloc[idx]["Kunde"]) if "Kunde" in df.columns and pd.notna(df.iloc[idx]["Kunde"]) else None
+            except Exception:
+                cust_id = None
+            allowed_names = set(per_customer_allowed.get(cust_id, [])) if cust_id is not None else set()
+        else:
+            allowed_names = None
+
         z_raw, dist, top_changes = find_counterfactual(
-            x0_raw, names, model, scaler, policy, max_iter=200, p_target=p_target, tau=None
+            x0_raw,
+            names,
+            model,
+            scaler,
+            policy,
+            max_iter=200,
+            p_target=p_target,
+            tau=None,
+            allowed_feature_names=allowed_names,
         )
         p_new = float(model.predict_proba(scaler.transform(z_raw.reshape(1, -1)))[0, 1])
         no_cf = bool(p_new > p_target)
@@ -692,6 +985,16 @@ def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
 
         _upsert_table("cf_individual", individual)
         _upsert_table("cf_aggregate", aggregate)
+        # Zusätzlich SHAP-Varianten
+        _upsert_table("cf_individual_shap", individual)
+        _upsert_table("cf_aggregate_shap", aggregate)
+
+        # Digitalization-Segmentierte CF-Analyse (analog zu SHAP)
+        try:
+            print("📊 Erstelle Digitalization-segmentierte CF-Analyse...")
+            _create_digitalization_segmented_analysis(individual, aggregate, df, experiment_id, db)
+        except Exception as e:
+            print(f"⚠️ Digitalization-Segmentierung übersprungen: {e}")
 
         # Raw Reports: baue Mapping raw->engineered nur aus Policy-Auswahl
         raw_to_eng: Dict[str, List[str]] = {}
@@ -724,6 +1027,7 @@ def run(experiment_id: int, sample: float = 0.2, limit: int = 0) -> bool:
 
     # Beispiele (3) aus erfolgreichen Fällen als Sätze ausgeben
     try:
+        mapping = load_feature_mapping()
         inv = invert_mapping(mapping)
         examples: List[str] = []
         for rec in individual:
